@@ -41,8 +41,20 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 
+#ifdef _WIN64
+    #define WIN_PLATFORM
+#else
+    #define GEN_PLATFORM
+#endif // _WIN64
+
+#ifdef WIN_PLATFORM
+    #define WINDOWS_LEAN_AND_MEAN
+    #include <windows.h>
+#else
+    #include <chrono>
+#endif // _WIN64
+
 #include <fstream>
-#include <chrono>
 #include <mutex>
 
 namespace profiler {
@@ -94,6 +106,10 @@ namespace profiler {
         static std::fstream outFile; // Output destination
         static Timestamp_t startTs;  // Offset for each timestamp logged
 
+#ifdef WIN_PLATFORM
+        static LARGE_INTEGER tickCost; // Per-Tick time
+#endif
+
         // Per-Thread attributes
         static thread_local ThreadId_t threadId;                // Thread-Id
         static thread_local char buffer[MAX_EVENT_DUMP_LENGHT]; // Internal buffer to store tmp string
@@ -102,16 +118,28 @@ namespace profiler {
          * Returns a timestamp (ns) from epoch
          */
         Timestamp_t inline timestamp() noexcept {
-            const auto& now = std::chrono::steady_clock::now();
-            const auto& tp = std::chrono::time_point_cast<std::chrono::microseconds>(now);
+#ifdef WIN_PLATFORM
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            return now.QuadPart;
+#else
+            auto now = std::chrono::steady_clock::now();
+            auto tp  = std::chrono::time_point_cast<std::chrono::microseconds>(now);
             return tp.time_since_epoch().count();
+#endif
         }
 
         /**
          * Returns a timestamp (ns) from profiler initialization
          */
         Timestamp_t inline timestampFromInit() noexcept {
+#ifdef WIN_PLATFORM
+            auto diff = (timestamp() - startTs); // Compute difference
+            diff *= 1000000;                     // Convert us -> sec
+            return diff / tickCost.QuadPart;     // Return timestamp
+#else
             return timestamp() - startTs;
+#endif
         }
 
         /**
@@ -122,6 +150,7 @@ namespace profiler {
          * is synchronized.
          */
         void inline event(const char* name, char type, Timestamp_t ts) noexcept {
+            auto ts1 = timestampFromInit();
             auto bytes = sprintf(
                 buffer,
                 "{\"name\":\"%.32s\",\"ph\":\"%c\",\"ts\":%llu,\"tid\":%llu},",
@@ -131,6 +160,19 @@ namespace profiler {
             {
                 std::lock_guard<std::mutex> guard(ioMutex);
                 outFile.write(buffer, bytes);
+                auto ts2 = timestampFromInit();
+                bytes = sprintf(
+                    buffer,
+                    "{\"name\":\"%.32s\",\"ph\":\"%c\",\"ts\":%llu,\"tid\":%llu},",
+                    __func__, type, ts1, threadId
+                );
+                outFile.write(buffer, bytes);
+                    bytes = sprintf(
+                    buffer,
+                    "{\"name\":\"%.32s\",\"ph\":\"%c\",\"ts\":%llu,\"tid\":%llu},",
+                    __func__, type, ts2, threadId
+                );
+                outFile.write(buffer, bytes);
             }
         }
 
@@ -139,6 +181,10 @@ namespace profiler {
     void init(const char* filename) {
         // Set the starting timestamp (to offset future samples)
         _internal::startTs = _internal::timestamp();
+
+#ifdef WIN_PLATFORM
+        QueryPerformanceFrequency(&_internal::tickCost);
+#endif
 
         // Open the output file
         _internal::outFile.open(filename, std::fstream::out);
